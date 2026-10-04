@@ -31,6 +31,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
+from psycopg2.errors import DeadlockDetected, SerializationFailure
 
 from . import db
 from . import audit
@@ -126,7 +127,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -149,6 +150,35 @@ async def version_conflict_handler(request, exc: db.VersionConflict):
                 "message": f"版本过期：当前版本为 {exc.current}，提交基于版本 {exc.expected}，请重新读取后再试",
                 "current_version": exc.current,
                 "expected_version": exc.expected,
+            }
+        },
+    )
+
+
+@app.exception_handler(DeadlockDetected)
+async def deadlock_handler(request, exc):
+    # 兜底：所有写路径统一“先版本行后事件行”的锁序，正常不会死锁；
+    # 若数据库仍判定死锁/串行化失败，按并发版本冲突处理（事务已回滚，
+    # 无任何部分变更），由客户端重新读取最新状态后判定，绝不向调度员报 500。
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "code": "VERSION_CONFLICT",
+                "message": "并发写入冲突：该请求已被整体回滚，请重新读取当前版本后再试",
+            }
+        },
+    )
+
+
+@app.exception_handler(SerializationFailure)
+async def serialization_failure_handler(request, exc):
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "code": "VERSION_CONFLICT",
+                "message": "并发写入冲突：该请求已被整体回滚，请重新读取当前版本后再试",
             }
         },
     )
@@ -351,9 +381,17 @@ def get_events():
 # ---------------------------------------------------------------- 复供
 
 
-def _load_restore_context(conn, event_id: int, *, for_update: bool = False):
-    """读取事件、快照与其他待修复事件。调用方负责事件存在性/状态/版本判定。"""
-    event = db.get_event(conn, event_id, for_update=for_update)
+# 全服务写路径统一加锁顺序：**先锁 network_meta 版本行，再锁事件行**。
+# 隔离提交、复供确认、水源切换、整网重导（锁版本行后 TRUNCATE 事件表）均按此
+# 顺序取锁，任意两个写事务之间只可能同向等待，不可能形成锁环。
+# 复供确认在版本行锁保护下读取最终串行状态并完成全部复核，失败即整体回滚，
+# 绝不重开阀门、推进版本或留下事件与快照。
+def _restore_preview_context(conn, event_id: int):
+    """只读预演：事件、阀位与其余待修复故障必须来自同一只读快照时刻。
+
+    事件不存在 / 已复供沿用既有 EVENT_NOT_FOUND / EVENT_ALREADY_RESTORED。
+    """
+    event = db.get_event(conn, event_id)
     if event is None:
         raise ApiError(404, "EVENT_NOT_FOUND", f"隔离事件不存在：{event_id}")
     if event["status"] != db.EVENT_OPEN:
@@ -362,11 +400,8 @@ def _load_restore_context(conn, event_id: int, *, for_update: bool = False):
             "EVENT_ALREADY_RESTORED",
             f"隔离事件 {event_id} 已复供，不能重复操作",
         )
-    version, _updated_at, nodes, pipes = db.load_snapshot(
-        conn, for_update=for_update
-    )
-    other_open = db.list_open_events(conn, exclude_event_id=event_id,
-                                     for_update=for_update)
+    version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+    other_open = db.list_open_events(conn, exclude_event_id=event_id)
     other_fault_ids = frozenset(e["fault_pipe_id"] for e in other_open)
     result = evaluate_restore(
         nodes,
@@ -375,6 +410,65 @@ def _load_restore_context(conn, event_id: int, *, for_update: bool = False):
         other_fault_pipe_ids=other_fault_ids,
     )
     return version, event, result
+
+
+def _restore_confirm_context(conn, event_id: int, expected_version: int):
+    """写路径：按统一锁序取锁后，基于**最终串行状态**完成全部复核。
+
+    锁定与判定顺序（任何一步失败都在写入前抛出，事务由外层整体回滚）：
+      1. 先锁 network_meta 版本行（与整网重导/隔离提交/水源切换同一入口锁，
+         杜绝锁环），并锁后读取最新版本与节点/管段；
+      2. 再锁目标事件行：不存在 → 404 EVENT_NOT_FOUND（含整网重导清空事件；
+         即使请求版本已过期，事件不存在仍优先报 404）；
+      3. 版本复核：携带版本 ≠ 锁内最新版本 → 409 VERSION_CONFLICT
+         （并发写已把版本推进，按最终串行状态判定）；
+      4. 已复供 → 409 EVENT_ALREADY_RESTORED（版本匹配但事件已被复供）；
+      5. 最后按编号锁定其余待修复事件行并复核安全性，不安全 → 422
+         RESTORE_UNSAFE。
+
+    因此两个原本均安全的同版并发确认拿到版本行锁后被串行化：先提交者成功，
+    后到者在锁内读到的版本已推进，沿用 409 VERSION_CONFLICT，绝不双双成功。
+    """
+    # 1) 版本行锁最先取（保证与所有写路径锁序一致）；锁内读取最新状态
+    version, _updated_at, nodes, pipes = db.load_snapshot(conn, for_update=True)
+
+    # 2) 目标事件行锁：不存在优先于版本判定（重导后旧事件 -> 404，而非 409）
+    event = db.get_event(conn, event_id, for_update=True)
+    if event is None:
+        raise ApiError(404, "EVENT_NOT_FOUND", f"隔离事件不存在：{event_id}")
+
+    # 3) 版本复核：并发先提交者已把版本推进，后到者按最终串行状态得 409
+    if version != expected_version:
+        raise db.VersionConflict(version, expected_version)
+
+    # 4) 版本匹配但事件已复供：重复复供 -> 409 EVENT_ALREADY_RESTORED
+    if event["status"] != db.EVENT_OPEN:
+        raise ApiError(
+            409,
+            "EVENT_ALREADY_RESTORED",
+            f"隔离事件 {event_id} 已复供，不能重复操作",
+        )
+
+    # 5) 其余待修复事件行锁（按 id 排序锁定，锁序恒定）。此时版本行锁保护下
+    #    读到的节点/管段与事件集即最终串行状态，安全复核不会跨提交拼接。
+    other_open = db.list_open_events(
+        conn, exclude_event_id=event_id, for_update=True
+    )
+    other_fault_ids = frozenset(e["fault_pipe_id"] for e in other_open)
+    result = evaluate_restore(
+        nodes,
+        pipes,
+        reopen_pipe_ids=frozenset(event["closed_pipe_ids"]),
+        other_fault_pipe_ids=other_fault_ids,
+    )
+    if not result.safe:
+        raise ApiError(
+            422,
+            "RESTORE_UNSAFE",
+            "复供存在重新进水风险：其他待修复故障管段的端点将重新通水",
+            issues=result.blocks,
+        )
+    return event, result
 
 
 @app.post(
@@ -387,7 +481,7 @@ def restore_preview(event_id: int, payload: RestoreIn):
     # 只读快照：事件、阀位、其余待修复故障必须来自同一提交时刻；
     # 事件不存在 / 已复供沿用既有 EVENT_NOT_FOUND / EVENT_ALREADY_RESTORED。
     with db.read_transaction() as conn:
-        version, event, result = _load_restore_context(conn, event_id)
+        version, event, result = _restore_preview_context(conn, event_id)
 
     return serialize_restore_preview(version, payload.version, event, result)
 
@@ -396,22 +490,13 @@ def restore_preview(event_id: int, payload: RestoreIn):
     "/api/isolation/events/{event_id}/restore",
     response_model=RestoreOut,
     tags=["故障复供"],
-    summary="复供确认：同一事务内复核版本与安全性，原子重开阀门并更新事件状态",
+    summary="复供确认：统一锁序下按最终串行状态复核版本与安全性，原子重开阀门并更新事件状态",
 )
 def restore_confirm(event_id: int, payload: RestoreIn):
     with db.transaction() as conn:
-        # 锁定事件行/版本行后基于最新数据复核，保证不产生部分变更
-        version, event, result = _load_restore_context(conn, event_id, for_update=True)
-
-        if version != payload.version:
-            raise db.VersionConflict(version, payload.version)
-        if not result.safe:
-            raise ApiError(
-                422,
-                "RESTORE_UNSAFE",
-                "复供存在重新进水风险：其他待修复故障管段的端点将重新通水",
-                issues=result.blocks,
-            )
+        # 先锁版本行、再锁事件行：并发同版确认被串行化（至多一个成功），
+        # 与整网重导之间也是同一锁序，不可能死锁。
+        event, result = _restore_confirm_context(conn, event_id, payload.version)
 
         reopen_ids = list(event["closed_pipe_ids"])
         outcome = db.confirm_restore(

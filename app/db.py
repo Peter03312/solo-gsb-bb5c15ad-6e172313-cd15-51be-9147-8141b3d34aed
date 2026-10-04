@@ -136,6 +136,14 @@ CREATE TABLE IF NOT EXISTS state_snapshot_chain_meta (
 # 行锁，保证并发写入下“上一条现存快照”的读取—接链串行化，绝不形成分叉。
 CHAIN_LOCK_KEY = 741289001
 
+# 全服务写路径统一加锁顺序（死锁规避契约）：
+#   network_meta 版本行 (FOR UPDATE) → isolation_events 事件行 (按 id 升序 FOR UPDATE)
+# 整网导入先锁版本行再 TRUNCATE 事件表；隔离提交/水源切换只锁版本行；
+# 复供确认先锁版本行、再锁目标事件、最后按 id 锁其余待修复事件。
+# 任意两个写事务只按此同一方向取锁，故不可能形成锁环：两个调度员并发确认
+# 不同事件时在版本行上串行化，后到者按锁内最终状态得到 409 VERSION_CONFLICT；
+# 与整网重导交错也不会出现“事件行→版本行”与“版本行→事件表”的反向锁序。
+
 # 事件状态：待修复 / 已复供
 EVENT_OPEN = "open"
 EVENT_RESTORED = "restored"
@@ -523,8 +531,12 @@ def confirm_restore(
 ) -> dict:
     """在已开启的事务内完成复供确认。
 
-    调用方须已锁定事件行与版本行，并基于当前快照完成安全性复核。
-    本函数只负责：版本复核 → 重开阀门 → 版本 +1 → 事件置为已复供，原子生效。
+    调用方（路由层）必须已按全服务统一锁序完成锁定与复核：
+    **先锁 network_meta 版本行 → 再锁目标事件行 → 最后锁其余待修复事件行**，
+    并基于锁内最终串行状态确认：版本匹配、事件仍为 open、重开阀门安全。
+    本函数只负责：防御性复核版本 → 重开阀门 → 版本 +1 → 事件置为已复供，
+    原子生效。这里再次 SELECT ... FOR UPDATE 版本行只是幂等的防御性校验
+    （该行已被调用方持有，按同一锁序重入不会产生新的等待）。
     """
     with conn.cursor() as cur:
         cur.execute("SELECT version FROM network_meta WHERE id = 1 FOR UPDATE")
