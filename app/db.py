@@ -514,25 +514,38 @@ def list_open_events(conn, *, exclude_event_id: int | None = None,
     return [_serialize_event_row(r) for r in rows]
 
 
+def list_events_for_update(conn) -> list[dict]:
+    """按编号升序锁定**全部**事件行并返回（含待修复与已复供）。
+
+    复供确认在持有 network_meta 版本行锁后调用本函数：所有写事务共用
+    “先版本行、后事件行（事件行一律按 id 升序）”这一全局唯一锁序，
+    两个并发复供不会再各先锁自家事件而形成锁环，与整网重导（先锁版本行、
+    后 TRUNCATE 事件表）也锁序一致，绝不产生数据库死锁。
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM isolation_events ORDER BY id FOR UPDATE"
+        )
+        rows = cur.fetchall()
+    return [_serialize_event_row(r) for r in rows]
+
+
 def confirm_restore(
     conn,
     event_id: int,
-    expected_version: int,
+    current_version: int,
     reopened_pipe_ids: list[str],
     restored_sink_ids: list[str],
 ) -> dict:
     """在已开启的事务内完成复供确认。
 
-    调用方须已锁定事件行与版本行，并基于当前快照完成安全性复核。
-    本函数只负责：版本复核 → 重开阀门 → 版本 +1 → 事件置为已复供，原子生效。
+    调用方（路由层）须已按全局锁序先锁 network_meta 版本行、再按 id 升序
+    锁定全部事件行，并基于锁定后的当前快照完成事件状态、版本与安全性复核。
+    本函数只负责实际写入：重开阀门 → 版本 +1 → 事件置为已复供（条件更新
+    兜底并发），全部步骤与随后的状态快照在同一事务内原子生效；任何一步
+    失败整体回滚，绝不部分重开阀门、推进版本或留下事件与快照。
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT version FROM network_meta WHERE id = 1 FOR UPDATE")
-        row = cur.fetchone()
-        current_version = row[0] if row else 0
-        if current_version != expected_version:
-            raise VersionConflict(current_version, expected_version)
-
         if reopened_pipe_ids:
             cur.execute(
                 "UPDATE pipes SET valve_closed = FALSE "
@@ -550,7 +563,7 @@ def confirm_restore(
             "WHERE id = %s AND status = %s",
             (EVENT_RESTORED, event_id, EVENT_OPEN),
         )
-        if cur.rowcount != 1:  # 并发下事件已被复供：拒绝且不产生部分变更
+        if cur.rowcount != 1:  # 并发下事件已被复供/删除：拒绝且不产生部分变更
             raise RuntimeError(f"隔离事件 {event_id} 已复供或不存在")
         cur.execute("SELECT restored_at FROM isolation_events WHERE id = %s", (event_id,))
         restored_at = cur.fetchone()[0]

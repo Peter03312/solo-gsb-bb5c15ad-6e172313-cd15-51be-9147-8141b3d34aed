@@ -9,7 +9,7 @@
 - POST /api/isolation/submit                           隔离方案提交（原子关阀 + 版本 +1）
 - GET  /api/isolation/events                           隔离/复供操作历史
 - POST /api/isolation/events/{event_id}/restore/preview 复供预演（只读）
-- POST /api/isolation/events/{event_id}/restore        复供确认（单事务复核 + 重开阀门）
+- POST /api/isolation/events/{event_id}/restore        复供确认（统一锁序：先版本行后事件行，单事务按最终串行状态复核 + 重开阀门）
 - POST /api/sources/switch/preview                     水源停运/恢复预演（只读）
 - POST /api/sources/switch                             水源停运/恢复确认（单事务复核 + 原子改状态）
 - POST /api/delivery/evaluate                          用水点最低流量核算（只读：现有阀位/故障下最大可交付总量）
@@ -126,7 +126,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.5.0",
+    version="1.5.1",
     lifespan=lifespan,
 )
 
@@ -351,9 +351,20 @@ def get_events():
 # ---------------------------------------------------------------- 复供
 
 
-def _load_restore_context(conn, event_id: int, *, for_update: bool = False):
-    """读取事件、快照与其他待修复事件。调用方负责事件存在性/状态/版本判定。"""
-    event = db.get_event(conn, event_id, for_update=for_update)
+def _load_restore_context(conn, event_id: int, *, locked_events: list | None = None):
+    """读取事件、快照与其他待修复事件并评估复供安全性。
+
+    调用方负责事件存在性/状态/版本判定。
+    - 预演（locked_events=None）：只读一致性快照事务，事件、阀位、其余待修复
+      故障取自同一提交时刻，全程不加任何行锁。
+    - 确认（locked_events 非 None）：调用方须已按全局锁序先持有 network_meta
+      版本行锁、再按事件 id 升序锁定全部事件行（见 db.list_events_for_update），
+      本函数直接在这些锁内行内复核，不再重复加锁。
+    """
+    if locked_events is not None:
+        event = next((e for e in locked_events if e["id"] == event_id), None)
+    else:
+        event = db.get_event(conn, event_id)
     if event is None:
         raise ApiError(404, "EVENT_NOT_FOUND", f"隔离事件不存在：{event_id}")
     if event["status"] != db.EVENT_OPEN:
@@ -363,10 +374,11 @@ def _load_restore_context(conn, event_id: int, *, for_update: bool = False):
             f"隔离事件 {event_id} 已复供，不能重复操作",
         )
     version, _updated_at, nodes, pipes = db.load_snapshot(
-        conn, for_update=for_update
+        conn, for_update=locked_events is not None
     )
-    other_open = db.list_open_events(conn, exclude_event_id=event_id,
-                                     for_update=for_update)
+    other_open = db.list_open_events(
+        conn, exclude_event_id=event_id, for_update=False
+    )
     other_fault_ids = frozenset(e["fault_pipe_id"] for e in other_open)
     result = evaluate_restore(
         nodes,
@@ -396,14 +408,22 @@ def restore_preview(event_id: int, payload: RestoreIn):
     "/api/isolation/events/{event_id}/restore",
     response_model=RestoreOut,
     tags=["故障复供"],
-    summary="复供确认：同一事务内复核版本与安全性，原子重开阀门并更新事件状态",
+    summary="复供确认：统一锁序后在单事务内复核版本与安全性，原子重开阀门并更新事件状态",
 )
 def restore_confirm(event_id: int, payload: RestoreIn):
     with db.transaction() as conn:
-        # 锁定事件行/版本行后基于最新数据复核，保证不产生部分变更
-        version, event, result = _load_restore_context(conn, event_id, for_update=True)
+        # 全局唯一锁序：先锁 network_meta 版本行，再按事件 id 升序锁事件行。
+        # 两个并发复供（或复供与整网重导）由此串行化，绝不形成锁环/数据库死锁。
+        version, _updated_at, _nodes, _pipes = db.load_snapshot(conn, for_update=True)
+        locked_events = db.list_events_for_update(conn)
+
+        # 锁内按最新已提交状态复核：并发写入据此呈现“最终串行”结果。
+        _version, event, result = _load_restore_context(
+            conn, event_id, locked_events=locked_events
+        )
 
         if version != payload.version:
+            # 两个基于同一版本的安全确认：先到者成功推进版本，后到者沿用 409。
             raise db.VersionConflict(version, payload.version)
         if not result.safe:
             raise ApiError(
@@ -417,7 +437,7 @@ def restore_confirm(event_id: int, payload: RestoreIn):
         outcome = db.confirm_restore(
             conn,
             event_id=event_id,
-            expected_version=payload.version,
+            current_version=version,
             reopened_pipe_ids=reopen_ids,
             restored_sink_ids=result.restored_sink_ids,
         )

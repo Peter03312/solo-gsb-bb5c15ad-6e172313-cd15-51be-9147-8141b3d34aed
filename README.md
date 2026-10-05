@@ -148,10 +148,18 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   `FAULT_REWATER_RISK`（含故障管段编号与重新进水的端点 `reachable_endpoints`）；
 - 计算通水时排除：其他待修复事件的故障管段、以及**仍关闭的阀门**（仅重开本事件所关阀门）；
 - 复供确认 `POST /api/isolation/events/{event_id}/restore` 在**同一事务**内：
-  锁定事件行与版本行 → 复核版本 → 复核安全性 → 重开该事件阀门 → 版本 +1 → 事件置为 `restored`，原子生效。
-- 复供明确拒绝（均不产生部分变更）：
+  先锁定 `network_meta` 版本行，再**按事件 id 升序**锁定全部事件行（所有写事务
+  共用这一全局唯一锁序，与整网重导“先版本行后 TRUNCATE 事件表”一致），随后在
+  锁内按**最终已提交状态**复核版本与安全性 → 重开该事件阀门 → 版本 +1 →
+  事件置为 `restored`，原子生效。
+- 因此两个调度员**基于同一版本并发确认两条原本都安全的事件**时，事务被串行化：
+  **至多一个成功（200），后到者沿用 `409 VERSION_CONFLICT`**（携带
+  `current_version`/`expected_version`，重读后重预演即可），绝不会形成锁环、
+  返回数据库死锁/500；与整网重导交错时同理：重导先提交则旧事件随整网替换清空，
+  复供沿用 `404 EVENT_NOT_FOUND`。
+- 复供明确拒绝（均不产生部分变更：不重开阀门、不推进版本、不留事件与快照）：
   版本过期 `409 VERSION_CONFLICT`、事件不存在 `404 EVENT_NOT_FOUND`、
-  事件已复供 `409 EVENT_ALREADY_RESTORED`、重新进水风险 `422 RESTORE_UNSAFE`。
+  事件已复供 `409 EVENT_ALREADY_RESTORED`、最终状态下不安全 `422 RESTORE_UNSAFE`。
 
 **水源状态切换**（`POST /api/sources/switch/preview` 只读预演、`POST /api/sources/switch` 原子确认）：
 
@@ -642,6 +650,42 @@ curl -s -X POST http://localhost:8000/api/isolation/events/1/restore \
 - 已复供事件再次复供 → `409 EVENT_ALREADY_RESTORED`；
 - 整网重新导入后旧事件编号失效 → `404 EVENT_NOT_FOUND`。
 - 复供预演遇到过期版本不拒绝，只返回 `version_match=false`（与隔离预演一致）。
+
+#### 并发确认：统一锁序与最终串行状态判定
+
+复供确认是写操作，历史版本曾按“先锁自家事件行 → 再锁版本行 → 最后锁其余事件行”
+取锁。两个调度员**基于同一版本并发确认两条不同的待修复事件**时，会出现
+“A 持事件1 等版本行、B 持事件2 等版本行，拿到版本行后又互等对方事件行”的
+**锁环**，被数据库中止为死锁（HTTP 500）；与**整网重导**（先锁版本行后
+TRUNCATE 事件表）交错时锁序相反，同样可能死锁。
+
+本轮把所有写路径统一为**同一把锁序：先锁 `network_meta` 版本行（单行即天然
+串行点），再按事件 `id` 升序锁事件行**。复供确认在拿到全部锁后，于同一事务内
+按**最终已提交状态**重新复核，因此并发写入的结果等价于按某种顺序串行执行：
+
+| 并发情形 | 先提交者 | 后到请求 |
+| --- | --- | --- |
+| 两个同版、单独预演都 `safe=true` 的复供 | `200`（版本 +1、阀门重开、事件 restored、一条快照） | `409 VERSION_CONFLICT`（无任何写入） |
+| 复供与整网重导交错，重导先落地 | 重导 `200`（版本重置为 1、事件清空） | 复供 `404 EVENT_NOT_FOUND` |
+| 复供与整网重导交错，复供先落地 | 复供 `200` | 重导随后 `200`（整网替换，复供结果随之失效） |
+| 事件已被另一请求复供 | — | `409 EVENT_ALREADY_RESTORED` |
+| 最终状态下重开会令其余待修复故障重新进水 | — | `422 RESTORE_UNSAFE` |
+
+失败请求在写入前即被拒绝，**不会部分重开阀门、不会推进版本、也不会留下事件
+状态变更与状态快照**（成功方仅产生一条 `restore_confirm` 快照）；复供**预演**
+入口、入参、响应字段与只读语义均不变。可重复运行的并发调用示例：
+
+```bash
+# 需先启动服务（docker compose up --build 或本地 uvicorn）
+python3 examples/restore_concurrency_demo.py
+# 或指定地址：
+python3 examples/restore_concurrency_demo.py http://localhost:8000
+```
+
+脚本用两个线程同时带同一 `version` 确认两条独立支管上的复供事件，连续多轮断言
+“恰好一个 200、另一个 409”，并核对版本恰好 +1、仅成功方阀门重开、仅一条新快照；
+随后演示复供与整网重导并发（无 500，输者 200/404），以及串行的
+`404 EVENT_NOT_FOUND` / `409 EVENT_ALREADY_RESTORED` / `422 RESTORE_UNSAFE`。
 
 ### 8. 关阀建议（只知道故障管段时）
 
@@ -1609,6 +1653,15 @@ python3 examples/restore_demo.py
 python3 examples/restore_demo.py http://localhost:8000
 ```
 
+并发复供流程（两个同版安全确认并发：恰好一个 200、另一个 409 VERSION_CONFLICT；
+与整网重导交错无死锁；404/409/422 拒绝均无部分写入）：
+
+```bash
+python3 examples/restore_concurrency_demo.py
+# 或指定地址：
+python3 examples/restore_concurrency_demo.py http://localhost:8000
+```
+
 水源调度流程（停运顶供 → 全网停运 → 恢复供水 → 恢复水源的重新进水风险拒绝 → 故障复供后恢复）：
 
 ```bash
@@ -1651,17 +1704,20 @@ python3 examples/consistent_read_demo.py http://localhost:8000
 python3 -m unittest tests.test_planning tests.test_audit -v
 ```
 
-路由层集成测试（`tests/test_api.py`）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、**临时旁通管评估（基线对照/重新进水判不可用/并联/422/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖、**摘要链同事务接链/区间核验 ok·边界不符·内容损坏·链断定位/编号空洞不断链/倒序与缺端点 4xx/只读**、**只读一致性快照（关阀建议/隔离·复供·水源切换预演/流量核算/旁通/读数核对/调度演练在并发提交下只返回写入前或写入后的完整视图）**）；`tests/test_db_readonly.py` 用 mock 连接校验只读快照事务的连接级语义（`REPEATABLE READ READ ONLY`、回滚释放、异常安全）。需先安装依赖：
+路由层集成测试（`tests/test_api.py`）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、**临时旁通管评估（基线对照/重新进水判不可用/并联/422/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖、**摘要链同事务接链/区间核验 ok·边界不符·内容损坏·链断定位/编号空洞不断链/倒序与缺端点 4xx/只读**、**只读一致性快照（关阀建议/隔离·复供·水源切换预演/流量核算/旁通/读数核对/调度演练在并发提交下只返回写入前或写入后的完整视图）**、**复供并发（两个同版安全确认恰好 1×200+1×409 且版本/阀位/快照各只有一份、与整网重导交错只串行不死锁、锁内按最终状态复核 409/422）**）；`tests/test_db_readonly.py` 用 mock 连接校验只读快照事务的连接级语义（`REPEATABLE READ READ ONLY`、回滚释放、异常安全）。需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
 python3 -m unittest discover -s tests -v
 ```
 
-> 另有一条默认跳过的真实 PostgreSQL 快照隔离集成测试
-> `tests/test_api.ReadConsistencyPostgresTests`：在可连的 PostgreSQL 上
-> （docker compose 起库后）以 `RUN_DB_TESTS=1` 开启，验证只读事务跨并发提交
-> 仍稳定看到写入前完整视图、新事务再看到写入后完整视图。
+> 另有两条默认跳过的真实 PostgreSQL 集成测试（docker compose 起库后以
+> `RUN_DB_TESTS=1` 开启）：`tests/test_api.ReadConsistencyPostgresTests`
+> 验证只读事务跨并发提交仍稳定看到写入前完整视图、新事务再看到写入后完整视图；
+> `tests.test_restore_concurrency_pg.RestoreConcurrencyPostgresTests` 直接在
+> 真实库上以紧密交错（屏障连接先占版本行）制造两个同版复供并发、复供与整网
+> 重导交错，验证统一锁序下**无数据库死锁**且结果恰为 `200 + 409 VERSION_CONFLICT`
+> （或重导赢时 `404 EVENT_NOT_FOUND`），版本恰好 +1、仅成功方阀门重开。
 
 ## 八、项目结构
 
@@ -1680,6 +1736,7 @@ examples/
   sources_network.json    # 水源调度演示管网（双水源联网）
   demo.py                 # 隔离全流程示例
   restore_demo.py         # 复供全流程示例
+  restore_concurrency_demo.py # 并发复供示例（同版并发确认 1×200+1×409、与整网重导交错无死锁、404/409/422 无部分写入）
   recommend_demo.py       # 关阀建议全流程示例
   source_switch_demo.py   # 水源停运/恢复全流程示例
   delivery_demo.py        # 用水点最低流量核算全流程示例（只读：水源/管段上限、瓶颈、停运/关阀阻断）
@@ -1694,6 +1751,7 @@ tests/
   test_planning.py
   test_audit.py
   test_api.py
+  test_restore_concurrency_pg.py # 真实 PostgreSQL 复供并发/统一锁序回归（默认跳过，RUN_DB_TESTS=1 开启）
   test_db_readonly.py   # 只读快照事务的连接级语义（mock psycopg2，无需真实数据库）
 Dockerfile
 docker-compose.yml

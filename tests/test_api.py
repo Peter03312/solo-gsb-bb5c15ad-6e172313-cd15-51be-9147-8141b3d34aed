@@ -87,38 +87,37 @@ def fake_read_transaction():
 @contextmanager
 def fake_transaction():
     conn = "FAKE_TX"
-    # 简单快照：提交时把暂存区落盘
-    snapshot = (
-        STORE.version,
-        dict(STORE.nodes),
-        {k: Pipe(**v.__dict__) for k, v in STORE.pipes.items()},
-    )
-    tmp = {
-        "version": STORE.version,
-        "nodes": dict(STORE.nodes),
-        "pipes": dict(STORE.pipes),
-        "events": list(STORE.events),
-        "next_id": STORE.next_event_id,
-        "snapshots": list(STORE.snapshots),
-        "next_snapshot_id": STORE.next_snapshot_id,
-        "chains": dict(STORE.chains),
-        "anchor": STORE.anchor,
-    }
-    try:
-        yield conn
-        if STORE.fail_commit:
-            raise RuntimeError("simulated commit failure")
-    except Exception:
-        STORE.version = tmp["version"]
-        STORE.nodes = tmp["nodes"]
-        STORE.pipes = tmp["pipes"]
-        STORE.events = tmp["events"]
-        STORE.next_event_id = tmp["next_id"]
-        STORE.snapshots = tmp["snapshots"]
-        STORE.next_snapshot_id = tmp["next_snapshot_id"]
-        STORE.chains = tmp["chains"]
-        STORE.anchor = tmp["anchor"]
-        raise
+    # 模拟真实写事务的全局锁序：所有写路径先锁 network_meta 版本行
+    # （单行，互斥），再按事件 id 升序锁事件行。整个写事务期间持有该锁，
+    # 两个并发写被严格串行化，等价于真实库中版本行 FOR UPDATE 的效果。
+    with _WRITE_LOCK:
+        # 简单快照：提交时把暂存区落盘
+        tmp = {
+            "version": STORE.version,
+            "nodes": dict(STORE.nodes),
+            "pipes": {k: Pipe(**v.__dict__) for k, v in STORE.pipes.items()},
+            "events": list(STORE.events),
+            "next_id": STORE.next_event_id,
+            "snapshots": list(STORE.snapshots),
+            "next_snapshot_id": STORE.next_snapshot_id,
+            "chains": dict(STORE.chains),
+            "anchor": STORE.anchor,
+        }
+        try:
+            yield conn
+            if STORE.fail_commit:
+                raise RuntimeError("simulated commit failure")
+        except Exception:
+            STORE.version = tmp["version"]
+            STORE.nodes = tmp["nodes"]
+            STORE.pipes = tmp["pipes"]
+            STORE.events = tmp["events"]
+            STORE.next_event_id = tmp["next_id"]
+            STORE.snapshots = tmp["snapshots"]
+            STORE.next_snapshot_id = tmp["next_snapshot_id"]
+            STORE.chains = tmp["chains"]
+            STORE.anchor = tmp["anchor"]
+            raise
 
 
 def fake_init_db():
@@ -284,11 +283,28 @@ def fake_list_open_events(conn, exclude_event_id=None, for_update=False):
     ]
 
 
+# 写事务串行化锁：模拟真实库中“先锁 network_meta 版本行、再按 id 升序锁事件行”
+# 的全局唯一锁序。复供确认进入写事务即获取此锁，两个并发确认被串行化，
+# 后到者在锁内看到先到者已推进的版本，按最终串行状态得到 409 VERSION_CONFLICT。
+_WRITE_LOCK = threading.RLock()
+
+
+def fake_list_events_for_update(conn):
+    # 与 db.list_events_for_update 一致：按 id 升序返回并锁定全部事件行。
+    # 真实锁序由 fake_transaction 持有的 _WRITE_LOCK 模拟（版本行→事件行）。
+    return [copy.deepcopy(e) for e in sorted(STORE.events, key=lambda e: e["id"])]
+
+
 def fake_confirm_restore(
-    conn, event_id, expected_version, reopened_pipe_ids, restored_sink_ids
+    conn, event_id, current_version, reopened_pipe_ids, restored_sink_ids
 ):
-    if STORE.version != expected_version:
-        raise db.VersionConflict(STORE.version, expected_version)
+    # 复制 db.confirm_restore 的关键语义：调用方已锁版本行/事件行并完成复核；
+    # 版本直接采用锁内读到的 current_version（推进 = 锁内版本 + 1），
+    # 重开阀门 → 版本 +1 → 事件置为 restored，随后同事务冻结快照。
+    if STORE.version != current_version:
+        raise AssertionError(
+            f"confirm_restore 锁内版本漂移：{STORE.version} != {current_version}"
+        )
     event = next((e for e in STORE.events if e["id"] == event_id), None)
     if event is None or event.get("status", "open") != "open":
         raise RuntimeError("event not open")
@@ -297,8 +313,7 @@ def fake_confirm_restore(
         STORE.pipes[pid] = Pipe(
             p.id, p.from_node, p.to_node, p.has_valve, False, p.name
         )
-    before = STORE.version
-    STORE.version += 1
+    STORE.version = current_version + 1
     import datetime
 
     restored_at = datetime.datetime(2026, 9, 30, 13, 0, 0)
@@ -415,6 +430,7 @@ db.submit_isolation = fake_submit_isolation
 db.list_events = fake_list_events
 db.get_event = fake_get_event
 db.list_open_events = fake_list_open_events
+db.list_events_for_update = fake_list_events_for_update
 db.confirm_restore = fake_confirm_restore
 db.switch_sources = fake_switch_sources
 db.insert_state_snapshot = fake_insert_state_snapshot
@@ -473,11 +489,31 @@ RESTORE_NETWORK = {
 }
 
 
+# 两条互不影响的独立支管（复供并发测试）：
+# S --V1[阀]-- J1 --F1-- U1
+# S --V2[阀]-- J2 --F2-- U2
+# 各自故障由各自阀门隔离；同版下两个复供互不影响、单独看都安全。
+TWIN_BRANCH_NETWORK = {
+    "nodes": [
+        {"id": "S", "type": "source"},
+        {"id": "J1", "type": "junction"},
+        {"id": "J2", "type": "junction"},
+        {"id": "U1", "type": "sink"},
+        {"id": "U2", "type": "sink"},
+    ],
+    "pipes": [
+        {"id": "V1", "from": "S", "to": "J1", "has_valve": True},
+        {"id": "F1", "from": "J1", "to": "U1"},
+        {"id": "V2", "from": "S", "to": "J2", "has_valve": True},
+        {"id": "F2", "from": "J2", "to": "U2"},
+    ],
+}
+
+
 # 双水源管网（演示水源停运/恢复）：
 # S1 --Q1[阀]-- C --Q2[阀]-- U1
 # S2 --Q3[阀]-- C --Q4[阀]-- U2
-TWO_SOURCE_NETWORK = {
-    "nodes": [
+TWO_SOURCE_NETWORK = {    "nodes": [
         {"id": "S1", "type": "source"},
         {"id": "S2", "type": "source"},
         {"id": "C", "type": "junction"},
@@ -1099,6 +1135,136 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 404)
         self.assertEqual(r.json()["error"]["code"], "EVENT_NOT_FOUND")
+
+    # ----------------------------------------------- 复供并发：最终串行状态判定
+
+    def _submit_two_independent_safe_restores(self):
+        """两条互不影响的支管故障：同版下两个复供各自都安全。
+
+        S-V1-J1-F1-U1 与 S-V2-J2-F2-U2：隔离时各关各阀（V1/V2），
+        彼此的待修复故障管段（F1/F2）均不在对方支管，复供互不影响。
+        """
+        self.client.post("/api/network/import", json=TWIN_BRANCH_NETWORK)
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "F1", "close_pipe_ids": ["V1"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        e1 = r.json()["event_id"]
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "F2", "close_pipe_ids": ["V2"], "version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        e2 = r.json()["event_id"]
+        self.assertEqual(STORE.version, 3)
+        return e1, e2, 3
+
+    def test_concurrent_same_version_restores_exactly_one_succeeds(self):
+        # 两个调度员基于同一版本（3）并发确认两条原本均安全的复供：
+        # 写事务按全局锁序（先版本行后事件行）串行化，最终状态下至多一个成功，
+        # 另一个沿用 409 VERSION_CONFLICT；绝不出现 500/死锁。
+        for _ in range(20):
+            e1, e2, version = self._submit_two_independent_safe_restores()
+            snaps_before = len(STORE.snapshots)
+            results = {}
+
+            def fire(event_id, key):
+                r = self.client.post(
+                    f"/api/isolation/events/{event_id}/restore",
+                    json={"version": version},
+                )
+                results[key] = (
+                    r.status_code,
+                    r.json().get("error", {}).get("code", "OK"),
+                )
+
+            t1 = threading.Thread(target=fire, args=(e1, "a"))
+            t2 = threading.Thread(target=fire, args=(e2, "b"))
+            t1.start()
+            t2.start()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+            self.assertEqual(sorted(results.values()), [(200, "OK"), (409, "VERSION_CONFLICT")])
+            # 版本恰好 +1、恰好一个阀门重开、恰好一条事件 restored
+            self.assertEqual(STORE.version, version + 1)
+            self.assertEqual(
+                sum(1 for p in STORE.pipes.values() if p.valve_closed), 1
+            )
+            self.assertEqual(
+                sum(1 for e in STORE.events if e["status"] == "restored"), 1
+            )
+            # 失败方未留下任何快照：本轮成功方只产生一条复供快照
+            new_snaps = STORE.snapshots[snaps_before:]
+            self.assertEqual(
+                [s["op_type"] for s in new_snaps], ["restore_confirm"]
+            )
+
+    def test_concurrent_restore_and_reimport_no_deadlock_loser_is_409_or_404(self):
+        # 复供与整网重导交错：二者锁序一致（先版本行后事件行），只可能串行，
+        # 不可能死锁；复供赢则 200（重导随后整体重写），重导赢则事件被清空 -> 404。
+        for _ in range(10):
+            e1, _e2, version = self._submit_two_independent_safe_restores()
+            results = {}
+
+            def restore():
+                r = self.client.post(
+                    f"/api/isolation/events/{e1}/restore", json={"version": version}
+                )
+                results["restore"] = (
+                    r.status_code, r.json().get("error", {}).get("code", "OK")
+                )
+
+            def reimport():
+                r = self.client.post("/api/network/import", json=TWIN_BRANCH_NETWORK)
+                results["import"] = (
+                    r.status_code, r.json().get("error", {}).get("code", "OK")
+                )
+
+            t1 = threading.Thread(target=restore)
+            t2 = threading.Thread(target=reimport)
+            t1.start()
+            t2.start()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+            self.assertEqual(results["import"], (200, "OK"), results)
+            self.assertIn(
+                results["restore"],
+                [(200, "OK"), (404, "EVENT_NOT_FOUND"), (409, "VERSION_CONFLICT")],
+                results,
+            )
+            # 最终状态恒为重导后的干净版本 1、无事件、阀门全开
+            self.assertEqual(STORE.version, 1)
+            self.assertEqual(STORE.events, [])
+            self.assertTrue(all(not p.valve_closed for p in STORE.pipes.values()))
+
+    def test_unsafe_restore_after_other_event_restored_rechecks_final_state(self):
+        # 串行化后在锁内按最终状态复核：若另一事件在本请求等待期间被复供，
+        # 安全判定基于最新阀位/待修复事件，而不是请求开始时的旧快照。
+        # RESTORE_NETWORK：外层事件 1（关 P4）单独复供不安全（P7 会重新进水），
+        # 区内事件 2 复供安全；事件 2 先成功后，事件 1 的旧请求应得 409 版本过期，
+        # 用新版本重试则安全成功。
+        self._submit_two_faults()
+        r = self.client.post(
+            "/api/isolation/events/1/restore", json={"version": 3}
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "RESTORE_UNSAFE")
+        r = self.client.post("/api/isolation/events/2/restore", json={"version": 3})
+        self.assertEqual(r.status_code, 200)
+        # 旧请求基于版本 3：最终版本已为 4 -> 409 VERSION_CONFLICT，不重开阀门
+        r = self.client.post(
+            "/api/isolation/events/1/restore", json={"version": 3}
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "VERSION_CONFLICT")
+        self.assertTrue(STORE.pipes["P4"].valve_closed)
+        # 新版本 4 下最终状态已安全：复供成功
+        r = self.client.post(
+            "/api/isolation/events/1/restore", json={"version": 4}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(STORE.pipes["P4"].valve_closed)
 
     # ---------------------------------------------------------- 水源状态切换
 
@@ -3944,26 +4110,47 @@ class ReadConsistencyPostgresTests(unittest.TestCase):
     """在真实 PostgreSQL 上验证 REPEATABLE READ READ ONLY 读事务的跨提交稳定性。"""
 
     def setUp(self):
-        from app import db as real_db
+        import psycopg2
 
+        from app.config import get_settings
+        from tests._real_pg import load_real_db
+
+        # 本模块已用内存替身 monkeypatch 了 app.db；真实库测试取未被 patch 的副本。
+        real_db = load_real_db()
         self.db = real_db
-        with real_db.transaction() as conn:
+        self._psycopg2 = psycopg2
+        self._url = get_settings().database_url
+        # 直接连接真实库：自行建表（幂等）后重置管网。
+        conn = psycopg2.connect(self._url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(real_db.DDL)
+            conn.commit()
             real_db.replace_network(
                 conn,
                 [Node(id="S", type="source"), Node(id="U", type="sink")],
                 [Pipe(id="P1", from_node="S", to_node="U", has_valve=True)],
             )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _real_connect(self):
+        import psycopg2
+
+        from app.config import get_settings
+
+        return psycopg2.connect(get_settings().database_url)
 
     def _import_two_node_network(self):
         pass
 
     def test_reader_keeps_old_snapshot_across_concurrent_commit(self):
-        import psycopg2
-
-        from app.config import get_settings
-
         # 读者：开启只读快照事务，先读版本（固定快照为 v1）
-        read_conn = psycopg2.connect(get_settings().database_url)
+        read_conn = self._real_connect()
         read_conn.set_session(
             isolation_level=self.db.extensions.ISOLATION_LEVEL_REPEATABLE_READ,
             readonly=True,
@@ -3973,9 +4160,18 @@ class ReadConsistencyPostgresTests(unittest.TestCase):
                 cur.execute("SELECT version FROM network_meta WHERE id=1")
                 self.assertEqual(cur.fetchone()[0], 1)
 
-            # 另一连接提交一次水源停运（v2）
-            with self.db.transaction() as conn:
-                self.db.switch_sources(conn, expected_version=1, targets=[("S", False)])
+            # 另一连接提交一次水源停运（v2）——绕过内存替身，直接操作真实库
+            write_conn = self._real_connect()
+            try:
+                self.db.switch_sources(
+                    write_conn, expected_version=1, targets=[("S", False)]
+                )
+                write_conn.commit()
+            except Exception:
+                write_conn.rollback()
+                raise
+            finally:
+                write_conn.close()
 
             # 读者仍看到 v1 与停运前的 running=true（写入前完整视图）
             with read_conn.cursor() as cur:
@@ -3988,10 +4184,18 @@ class ReadConsistencyPostgresTests(unittest.TestCase):
             read_conn.close()
 
         # 新读事务看到写入后完整视图（v2、running=false）
-        with self.db.read_transaction() as conn:
-            version, _ts, nodes, _pipes = self.db.load_snapshot(conn)
+        new_conn = self._real_connect()
+        new_conn.set_session(
+            isolation_level=self.db.extensions.ISOLATION_LEVEL_REPEATABLE_READ,
+            readonly=True,
+        )
+        try:
+            version, _ts, nodes, _pipes = self.db.load_snapshot(new_conn)
             self.assertEqual(version, 2)
             self.assertFalse(nodes["S"].running)
+        finally:
+            new_conn.rollback()
+            new_conn.close()
 
 
 if __name__ == "__main__":
